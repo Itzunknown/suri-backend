@@ -1,12 +1,10 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import requests
 import re
 
 app = Flask(__name__)
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
+CORS(app)
 
 @app.route('/')
 def home():
@@ -14,71 +12,56 @@ def home():
 
 @app.route('/api')
 def get_direct():
-    url = request.args.get('url', '').strip()
-    if not url:
-        return jsonify({"error": "No url"}), 400
+    terabox_url = request.args.get('url')
+    if not terabox_url:
+        return jsonify({"error": "No URL provided"}), 400
 
     try:
-        # 1. DIRECT MP4/MKV/M3U8 - return as is
-        if url.endswith(('.mp4', '.mkv', '.m3u8', '.avi', '.mov', '.webm')) or '.mp4' in url:
-            return jsonify({"direct_link": url, "type": "direct"})
+        # Extract surl
+        match = re.search(r'/s/([A-Za-z0-9-_]+)', terabox_url)
+        if not match:
+            return jsonify({"error": "Invalid Terabox URL"}), 400
 
-        # 2. GOOGLE DRIVE
-        if 'drive.google.com' in url:
-            file_id = None
-            match = re.search(r'/d/([A-Za-z0-9_-]+)', url) or re.search(r'id=([A-Za-z0-9_-]+)', url)
-            if match:
-                file_id = match.group(1)
-                direct = f"https://drive.google.com/uc?export=download&id={file_id}"
-                return jsonify({"direct_link": direct, "type": "gdrive", "file_id": file_id})
+        surl = match.group(1)
 
-        # 3. DISKWALA / FILEPRESS
-        if 'diskwala' in url or 'filepress' in url:
-            session = requests.Session()
-            resp = session.get(url, headers=HEADERS, timeout=15).text
+        # Terabox API - New working method
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.terabox.com/'
+        }
 
-            # Try to find direct download button link
-            # Diskwala usually has fast download link in page
-            m = re.search(r'"downloadUrl"\s*:\s*"([^"]+)"', resp) or \
-                re.search(r'downloadUrl\s*=\s*"([^"]+)"', resp) or \
-                re.search(r'https://[^"]+\.mp4[^"]*', resp) or \
-                re.search(r'href="([^"]*download[^"]*)"', resp)
+        # Get file info
+        api_url = f"https://www.terabox.com/api/shorturlinfo?app_id=250528&shorturl={surl}&root=1"
+        resp = requests.get(api_url, headers=headers, timeout=15)
+        data = resp.json()
 
-            if m:
-                dlink = m.group(1) if hasattr(m, 'group') else m.group(0)
-                dlink = dlink.replace('\\/', '/').replace('\\u002F', '/')
-                return jsonify({"direct_link": dlink, "type": "diskwala"})
-            else:
-                return jsonify({"error": "Diskwala extraction failed, site changed", "debug": resp[:500]}), 500
+        if data.get('errno')!= 0:
+            # Try alternative method
+            api_url2 = f"https://terabox.hnn.workers.dev/api?url={terabox_url}"
+            try:
+                resp2 = requests.get(api_url2, timeout=15)
+                return jsonify(resp2.json())
+            except:
+                return jsonify({"error": "Terabox blocked, try again", "details": data}), 500
 
-        # 4. TERABOX FAMILY (terabox.com, terafileshare.com, 1024tera, etc)
-        if any(x in url for x in ['terabox', 'terafile', 'nephobox', 'mirrobox', '1024tera']):
-            session = requests.Session()
-            # Get surl
-            surl_match = re.search(r'/s/([A-Za-z0-9-_]+)', url)
-            if not surl_match:
-                return jsonify({"error": "Invalid terabox link"}), 400
-            surl = surl_match.group(1)
+        # Extract direct link
+        file_list = data.get('list', [])
+        if file_list and len(file_list) > 0:
+            file_info = file_list[0]
+            dlink = file_info.get('dlink', '')
 
-            # Get file list
-            list_url = f"https://www.terabox.com/share/list?app_id=250528&shorturl={surl}&root=1"
-            list_resp = session.get(list_url, headers=HEADERS, timeout=15).json()
+            if dlink:
+                return jsonify({
+                    "direct_link": dlink,
+                    "url": dlink,
+                    "filename": file_info.get('server_filename', 'video.mp4'),
+                    "size": file_info.get('size', 0)
+                })
 
-            if 'list' in list_resp and len(list_resp['list']) > 0:
-                file = list_resp['list'][0]
-                if 'dlink' in file:
-                    return jsonify({
-                        "direct_link": file['dlink'],
-                        "file_name": file.get('server_filename', 'video.mp4'),
-                        "type": "terabox"
-                    })
-
-            return jsonify({"error": "Terabox extraction failed", "debug": str(list_resp)[:500]}), 500
-
-        return jsonify({"error": f"Unsupported host: {url}"}), 400
+        return jsonify({"error": "No file found", "data": data}), 404
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "url": terabox_url}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
